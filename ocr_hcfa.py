@@ -2,152 +2,124 @@ import io
 import re
 from typing import List
 
+import numpy as np
 from PIL import Image
 from paddleocr import PaddleOCR
+from pdf2image import convert_from_bytes
 
 from models import Claim, ClaimLine
 
-# Initialize OCR once
+# Initialize OCR engine once at import time
 ocr_engine = PaddleOCR(lang="en", use_angle_cls=True, show_log=False)
 
+# Simple regex patterns
 CPT_REGEX = re.compile(r"\b(\d{5})\b")
-ICD_REGEX = re.compile(r"\b([A-TV-Z][0-9][A-Z0-9\.]{1,6})\b")
+ICD10_REGEX = re.compile(
+    r"\b([A-TV-Z][0-9A-TV-Z][0-9A-TV-Z](?:\.[0-9A-TV-Z]{1,4})?)\b"
+)
 DOB_REGEX = re.compile(
-    r"\b(0[1-9]|1[0-2])[/\-\.](0[1-9]|[12][0-9]|3[01])[/\-\.](19|20)\d{2}\b"
+    r"\b(0[1-9]|1[0-2])[\/\-](0[1-9]|[12][0-9]|3[01])[\/\-](19|20)\d{2}\b"
 )
 
-def _load_image_from_bytes(data: bytes, filename: str) -> Image.Image:
+
+def _bytes_to_image(file_bytes: bytes, filename: str) -> Image.Image:
+    """Convert uploaded bytes into a single PIL.Image.
+
+    - If a PDF: convert first page to image.
+    - Otherwise: attempt to open as an image file.
     """
-    Load an image from bytes. For now we support ONLY image types
-    (jpg, jpeg, png). PDFs are not supported yet on Railway.
+    lower_name = filename.lower()
+    if lower_name.endswith(".pdf"):
+        pages = convert_from_bytes(file_bytes, dpi=200)
+        if not pages:
+            raise ValueError("No pages found in PDF.")
+        return pages[0].convert("RGB")
+
+    # Fallback: treat as image
+    img = Image.open(io.BytesIO(file_bytes))
+    return img.convert("RGB")
+
+
+def _run_ocr(img: Image.Image) -> List[str]:
+    """Run PaddleOCR on a PIL image and return a list of recognized text strings."""
+    np_img = np.array(img)
+    result = ocr_engine.ocr(np_img, cls=True)
+    texts: List[str] = []
+    for line in result:
+        # Each line is a list of [box, (text, confidence)]
+        for box in line:
+            if len(box) >= 2 and isinstance(box[1], (list, tuple)) and len(box[1]) >= 1:
+                text = box[1][0]
+                if isinstance(text, str) and text.strip():
+                    texts.append(text.strip())
+    return texts
+
+
+def parse_hcfa_file(file_bytes: bytes, filename: str) -> Claim:
+    """Parse a HCFA form from PDF or image bytes into a Claim model.
+
+    This is intentionally conservative and educational:
+    - Attempts to detect CPT codes, ICD-10 codes, and DOB.
+    - Builds one ClaimLine per CPT.
+    - Maps ICD codes to pointers A, B, C, ...
     """
-    ext = filename.lower().split(".")[-1]
-    if ext in {"jpg", "jpeg", "png"}:
-        return Image.open(io.BytesIO(data)).convert("RGB")
-    # You can add PDF support later if you install poppler on your host.
-    raise ValueError("Please upload a JPG or PNG image of the HCFA form.")
+    if not file_bytes:
+        raise ValueError("Empty file bytes.")
 
-def _crop_regions(img: Image.Image):
-    """
-    Returns:
-      dob_img      -> region around Box 3 (DOB)
-      bottom_img   -> region around Box 21 + 24 (ICD + CPT lines)
+    img = _bytes_to_image(file_bytes, filename)
+    texts = _run_ocr(img)
 
-    The ratios are based on a standard CMS-1500 layout. You can tune
-    them later if your scanner crops differently.
-    """
-    w, h = img.size
+    # Combine text into a single string for regex scanning
+    full_text = "\n".join(texts)
 
-    # Box 3 (DOB) region
-    dob_y1 = int(0.18 * h)
-    dob_y2 = int(0.26 * h)
-    dob_x1 = int(0.28 * w)
-    dob_x2 = int(0.55 * w)
-    dob_img = img.crop((dob_x1, dob_y1, dob_x2, dob_y2))
+    # Extract CPT codes in the order they appear, de-duplicated
+    cpt_codes: List[str] = []
+    for match in CPT_REGEX.finditer(full_text):
+        code = match.group(1)
+        if code not in cpt_codes:
+            cpt_codes.append(code)
 
-    # Bottom portion with Box 21 + 24
-    bottom_y1 = int(0.40 * h)
-    bottom_y2 = int(0.92 * h)
-    bottom_img = img.crop((0, bottom_y1, w, bottom_y2))
+    # Extract ICD-10 codes
+    icd_codes: List[str] = []
+    for match in ICD10_REGEX.finditer(full_text):
+        code = match.group(1)
+        # Basic sanity filter: avoid things that are clearly not ICD
+        if len(code) >= 3 and code not in icd_codes:
+            icd_codes.append(code)
 
-    return dob_img, bottom_img
-
-def _run_ocr_pil(pil_img: Image.Image) -> List[str]:
-    """
-    Run PaddleOCR on a PIL image and return text lines.
-    """
-    import numpy as np
-
-    np_img = np.array(pil_img)
-    results = ocr_engine.ocr(np_img, cls=True)
-
-    lines: List[str] = []
-    for page in results:
-        for line in page:
-            text = line[1][0]
-            if text:
-                lines.append(text.strip())
-    return lines
-
-def parse_hcfa_file(data: bytes, filename: str) -> Claim:
-    """
-    HIPAA-safe HCFA parser:
-
-    - Accepts a JPG/PNG of the full HCFA-1500.
-    - Crops away the PHI-heavy sections (names, addresses, IDs).
-    - Keeps:
-        * Box 3 DOB (for age-dependent rules)
-        * Box 21 ICD codes
-        * Box 24 CPT/modifiers/charges
-
-    Returns a Claim object with lines + ICD map + optional DOB.
-    """
-    # 1) Load & crop
-    img = _load_image_from_bytes(data, filename)
-    dob_img, bottom_img = _crop_regions(img)
-
-    # 2) OCR DOB region
-    dob_lines = _run_ocr_pil(dob_img)
-    dob_text = " ".join(dob_lines)
-    dob_match = DOB_REGEX.search(dob_text)
+    # Extract DOB (first match)
+    dob_match = DOB_REGEX.search(full_text)
     dob = dob_match.group(0) if dob_match else None
 
-    # 3) OCR bottom (diagnosis + procedures)
-    bottom_lines = _run_ocr_pil(bottom_img)
-
-    icd_codes: List[str] = []
-    cpt_entries = []
-
-    for raw in bottom_lines:
-        line = raw.strip()
-
-        # ICD-10 codes
-        for icd in ICD_REGEX.findall(line):
-            if icd not in icd_codes:
-                icd_codes.append(icd)
-
-        # CPT codes + modifiers + charges
-        cpt_match = CPT_REGEX.search(line)
-        if cpt_match:
-            cpt = cpt_match.group(1)
-
-            mods = re.findall(
-                r"\b(\d{2}|RT|LT|TC|26|50|51|52|53|57|59|76|77)\b",
-                line,
-            )
-
-            charge_match = re.search(r"(\d+\.\d{2})", line)
-            charge = float(charge_match.group(1)) if charge_match else 0.0
-
-            cpt_entries.append(
-                {
-                    "cpt": cpt,
-                    "modifiers": list(dict.fromkeys(mods)),
-                    "units": 1,
-                    "charges": charge,
-                }
-            )
-
-    # 4) Build Claim object
+    # Build claim lines
     lines: List[ClaimLine] = []
-    for idx, item in enumerate(cpt_entries, 1):
-        lines.append(
-            ClaimLine(
-                line_number=idx,
-                cpt=item["cpt"],
-                modifiers=item["modifiers"],
-                diagnosis_pointers=[],
-                units=item["units"],
-                charges=item["charges"],
+    if not cpt_codes:
+        # Still return a Claim object, but with no lines
+        pass
+    else:
+        # Default diagnosis pointers – if we have ICDs, point to "A" by default
+        default_pointer = "A" if icd_codes else ""
+        for idx, cpt in enumerate(cpt_codes, start=1):
+            diagnosis_pointers = [default_pointer] if default_pointer else []
+            lines.append(
+                ClaimLine(
+                    line_number=idx,
+                    cpt=cpt,
+                    modifiers=[],
+                    diagnosis_pointers=diagnosis_pointers,
+                    units=1,
+                    charges=0.0,
+                )
             )
-        )
 
+    # Map ICD codes to letters A, B, C, ...
     icd_map = {chr(65 + i): code for i, code in enumerate(icd_codes)}
 
-    return Claim(
+    claim = Claim(
         payer="",
         pos="",
         lines=lines,
         icd10=icd_map,
         patient_dob=dob,
     )
+    return claim
