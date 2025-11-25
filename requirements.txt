@@ -1,7 +1,6 @@
 fastapi
 uvicorn[standard]
-paddleocr
-paddlepaddle
-pdf2image
 pillow
 python-multipart
+pytesseract
+pymupdf
